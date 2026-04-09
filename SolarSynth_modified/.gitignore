@@ -1,0 +1,13 @@
+# Documentation files
+css-sections.txt
+add-css-headers.sh
+
+# Backup files
+*.backup
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/

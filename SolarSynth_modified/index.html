@@ -1,0 +1,330 @@
+
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Solar Synth – Solar Wind Realtime Charts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+<link rel="stylesheet" href="style.css">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16x16.png">
+<link rel="icon" href="icons/favicon.ico">
+<link rel="manifest" href="icons/site.webmanifest">
+</head>
+
+<body>
+
+<div class="main-box">
+    <video autoplay muted loop playsinline id="bgVideo">
+        <source src="assets/liveWallpaper.mp4" type="video/mp4">
+    </video>
+
+    <div class="controls">
+        <div class="knob-wrapper">
+        <div id="speedKnobControl" class="knob"></div>
+        <!--<div class="knob-label">BPM</div>-->
+        <div id="speedValue">120 BPM</div>
+    </div>
+        <button id="playPauseBtn" class="attention-seeker" aria-label="Play/Pause"></button>
+        <button id="resetBtn" aria-label="Reset"></button>
+        <button id="metronomeBtn" aria-label="Metronome">
+            <img src="assets/metronome.svg" alt="Metronome" class="metronome-icon">
+        </button>
+        <button id="recordBtn" class="record-btn">
+            <span class="record-circle"></span>
+        </button>
+        <div class="meter-group">
+            <div class="db-readout" id="dbReadout">0 dB</div>
+            <div class="db-meter" aria-label="Output level">
+                <div class="db-meter-ticks">
+                    <span class="tick" data-label="-12"></span>
+                    <span class="tick" data-label="-6"></span>
+                    <span class="tick" data-label="-3"></span>
+                    <span class="tick" data-label="0"></span>
+                </div>
+                <div class="db-meter-fill" id="dbMeterFill"></div>
+            </div> 
+            <div class="volume-slider" aria-label="Volume slider">
+                <div class="volume-slider-thumb" id="volumeThumb" role="slider" aria-valuemin="-40" aria-valuemax="6" aria-valuenow="0" aria-label="Volume (dB)"></div>
+            </div>
+        </div>
+        
+            <!-- Solar Synth Logo -->
+            <div class="sun-synth-logo">
+                <img src="assets/logo-cropped.svg" alt="Solar Synth logo" class="sun-synth-logo-img">
+                <span class="sun-synth-text">SOLAR SYNTH</span>
+            </div>
+    </div>
+    <!-- TOP SECTION (MAIN): Arpeggiator area centered -->
+    <div class="keyboard-box">
+        <div class="kb-left">
+            <div class="container">
+                <div class="left-section">
+                    <div id="keyboardContainer"><!-- la tastiera verrà inserita qui via JS --></div>
+                    
+                    <div class="preview-controls-wrapper">
+                        <div class="preview-box">
+                            <canvas id="chartPreview" width="400" height="160"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right column: MODE and KEY side by side -->
+                <div class="right-section">
+                    <div class="controls-row">
+                        <!-- MODE Box: contains PRESETS and MIDI modes with a switch -->
+                        <div class="control-box" id="modeBox">
+                            <div class="control-box-title">MODE</div>
+                            <div class="mode-switch" role="tablist" aria-label="Mode switch">
+                                <button class="mode-option active" id="modePresetsBtn" aria-selected="true">PRESETS</button>
+                                <button class="mode-option" id="modeMidiBtn" aria-selected="false">MIDI</button>
+                            </div>
+                            <div class="mode-content">
+                                <!-- Presets Content -->
+                                <div id="modePresetsPanel" class="mode-panel" aria-labelledby="modePresetsBtn">
+                                    <div class="control-subtitle">SAMPLE PRESETS</div>
+                                    <select id="presetSampleSelect">
+                                        <option value="afterglow">Afterglow</option>
+                                        <option value="ember">Ember</option>
+                                        <option value="kelvin">Kelvin</option>
+                                        <option value="lumen">Lumen</option>
+                                        <option value="parsec">Parsec</option>
+                                        <option value="photon">Photon</option>
+                                        <option value="halo" selected>Halo</option>
+                                    </select>
+                                    
+                                </div>
+
+                                <!-- MIDI Content -->
+                                <div id="modeMidiPanel" class="mode-panel" aria-labelledby="modeMidiBtn" style="display:none;">
+                                    <div class="midi-controls-row">
+                                        <div class="midi-control-col">
+                                            <div class="control-subtitle">MIDI OUTPUT</div>
+                                            <select id="midiOutputSelect">
+                                                <option value="">-- None --</option>
+                                            </select>
+                                        </div>
+                                        <div class="midi-control-col">
+                                            <div class="control-subtitle">MIDI CHANNEL</div>
+                                            <select id="midiChannelSelect">
+                                                <option value="0" selected>1</option>
+                                                <option value="1">2</option>
+                                                <option value="2">3</option>
+                                                <option value="3">4</option>
+                                                <option value="4">5</option>
+                                                <option value="5">6</option>
+                                                <option value="6">7</option>
+                                                <option value="7">8</option>
+                                                <option value="8">9</option>
+                                                <option value="9">10</option>
+                                                <option value="10">11</option>
+                                                <option value="11">12</option>
+                                                <option value="12">13</option>
+                                                <option value="13">14</option>
+                                                <option value="14">15</option>
+                                                <option value="15">16</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Key Controls Box -->
+                        <div class="control-box" id="keyBox">
+                            <div class="control-box-title">KEY</div>
+                            <select id="rootNoteSelect">
+                                <option value="0">C (Do)</option>
+                                <option value="1">C# / Db</option>
+                                <option value="2">D (Re)</option>
+                                <option value="3">D# / Eb</option>
+                                <option value="4" selected>E (Mi)</option>
+                                <option value="5">F (Fa)</option>
+                                <option value="6">F# / Gb</option>
+                                <option value="7">G (Sol)</option>
+                                <option value="8">G# / Ab</option>
+                                <option value="9">A (La)</option>
+                                <option value="10">A# / Bb</option>
+                                <option value="11">B (Si)</option>
+                            </select>
+                            <select id="scaleSelect">
+                                <option value="none">No Scale</option>
+                                <option value="major" >Major</option>
+                                <option value="naturalMinor" selected>Natural Minor</option>
+                                <option value="majorPentatonic" >Major Pentatonic</option>
+                                <option value="minorPentatonic">Minor Pentatonic</option>
+                                <option value="chromatic">Chromatic</option>
+                                <option value="custom">Custom</option>
+                            </select>
+                        </div>
+                    </div>
+                    
+                    <!-- FFT Spectrum Analyzer with Parametric EQ -->
+                    <div class="spectrum-box">
+                        <div class="spectrum-header">
+                            <div class="filter-title">FILTER</div>
+                            <button class="effect-toggle" id="eqToggleBtn" data-effect="eq">OFF</button>
+                        </div>
+                        <div class="spectrum-display">
+                            <canvas id="spectrumCanvas" width="400" height="140"></canvas>
+                            <div id="filterDropOverlay" class="filter-drop-overlay">
+                                <div class="filter-drop-zone filter-drop-hp">HP</div>
+                                <div class="filter-drop-zone filter-drop-lp">LP</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MIDDLE SECTION: Charts under the arpeggiator -->
+    <div class="top-charts">
+        <div class="chart-box" data-chart-source="Temp" data-color="red" draggable="true">
+            <canvas id="chartTemp" width="400" height="90"></canvas>
+            <div class="chart-label">TEMPERATURE <span class="unit">[K]</span></div>
+        </div>
+
+        <div class="chart-box" data-chart-source="Dens" data-color="yellow" draggable="true">
+            <canvas id="chartDens" width="400" height="90"></canvas>
+            <div class="chart-label">DENSITY <span class="unit">[protons/cm<sup>3</sup>]</span></div>
+        </div>
+
+        <div class="chart-box" data-chart-source="Vel" data-color="green" draggable="true">
+            <canvas id="chartVel" width="400" height="90"></canvas>
+            <div class="chart-label">SPEED <span class="unit">[km/s]</span></div>
+        </div>
+    </div>
+
+    <!-- BOTTOM SECTION (EFFECTS): dedicated row with 4 modules -->
+    <section class="effects-section" aria-label="Effects">
+        <button id="randomizeEffectsBtn" class="random-dice-btn" aria-label="Randomize Effects">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><circle cx="16" cy="8" r="1.5"></circle><circle cx="8" cy="16" r="1.5"></circle><circle cx="8" cy="8" r="1.5"></circle><circle cx="16" cy="16" r="1.5"></circle><circle cx="12" cy="12" r="1.5"></circle></svg>
+        </button>
+        <div class="effects-title">EFFECTS</div>
+        <div class="effects-panel-container">
+        <!-- Distortion Effect -->
+        <div class="effect-module">
+            <div class="effect-title">DISTORTION</div>
+            <button class="effect-toggle" data-effect="distortion">OFF</button>
+            <div class="effect-params-row">
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Drive</div>
+                        <div class="effect-knob" id="distortionDriveKnob"></div>
+                    </div>
+                    <div class="effect-param">
+                        <div class="param-label">Tone</div>
+                        <div class="effect-knob" id="distortionToneKnob"></div>
+                    </div>
+                </div>
+                <div class="effect-separator"></div>
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Mix</div>
+                        <div class="effect-knob" id="distortionMixKnob"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chorus Effect -->
+        <div class="effect-module">
+            <div class="effect-title">CHORUS</div>
+            <button class="effect-toggle" data-effect="chorus">OFF</button>
+            <div class="effect-params-row">
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Depth</div>
+                        <div class="effect-knob" id="chorusDepthKnob"></div>
+                    </div>
+                    <div class="effect-param">
+                        <div class="param-label">Rate</div>
+                        <div class="effect-knob" id="chorusRateKnob"></div>
+                    </div>
+                </div>
+                <div class="effect-separator"></div>
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Mix</div>
+                        <div class="effect-knob" id="chorusMixKnob"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Delay Effect -->
+        <div class="effect-module">
+            <div class="effect-title">DELAY</div>
+            <button class="effect-toggle" data-effect="delay">OFF</button>
+            <div class="effect-params-row">
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Time</div>
+                        <div class="effect-knob" id="delayTimeKnob"></div>
+                    </div>
+                    <div class="effect-param">
+                        <div class="param-label">Feedback</div>
+                        <div class="effect-knob" id="delayFeedbackKnob"></div>
+                    </div>
+                </div>
+                <div class="effect-separator"></div>
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Mix</div>
+                        <div class="effect-knob" id="delayMixKnob"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reverb Effect -->
+        <div class="effect-module">
+            <div class="effect-title">REVERB</div>
+            <button class="effect-toggle" data-effect="reverb">OFF</button>
+            <div class="effect-params-row">
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Decay</div>
+                        <div class="effect-knob" id="reverbDecayKnob"></div>
+                    </div>
+                    <div class="effect-param">
+                        <div class="param-label">Size</div>
+                        <div class="effect-knob" id="reverbSizeKnob"></div>
+                    </div>
+                </div>
+                <div class="effect-separator"></div>
+                <div class="effect-param-group">
+                    <div class="effect-param">
+                        <div class="param-label">Mix</div>
+                        <div class="effect-knob" id="reverbMixKnob"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+
+</div>
+
+<!-- Context Menu per rimuovere il controllo del grafico -->
+<div id="knobContextMenu" class="context-menu" style="display: none;">
+    <div class="context-menu-item" id="removeControl">Remove Control</div>
+</div>
+
+<!-- Context Menu per il Filter Spectrum -->
+<div id="filterContextMenu" class="context-menu" style="display: none;">
+    <div class="context-menu-item" id="removeHPControl">Remove control from High Pass</div>
+    <div class="context-menu-item" id="removeLPControl">Remove control from Low Pass</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tone@14.8.39/build/Tone.min.js"></script>
+<script type="module" src="js/main.js"></script>
+
+</body>
+</html>
