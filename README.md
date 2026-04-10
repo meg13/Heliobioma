@@ -164,9 +164,12 @@ Because opening a new folder in VS Code closed the sync server file:
    ```
 2. Run it.
    You should see confirmation that the audio engine, HTTP server (port 8080), and WebSocket connection to the sync server are active.
-3. The controller will open its own web interface (or you can open `LivePlanting_modified/html/live_listening.html` via browser).
-4. Press **A** in the terminal (or click **Start Listening** in the UI) to begin sonification.
-
+3. Use the following keyboard controls in the terminal:
+   - **A** — start listening (begin sonification)
+   - **B** — stop listening
+   - **C** — start/stop the ambience
+   - **D** — switch from non-synced live planting to synced live planting and vice versa
+   - **E** — record a sample
 ---
 
 ## Data Flow Summary
