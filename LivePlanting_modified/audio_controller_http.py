@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import socket
 import sounddevice as sd
 import serial
 import websockets
@@ -35,6 +36,16 @@ WS_URI = "ws://127.0.0.1:8765"
 
 SERIAL_PORT = "COM10"
 SERIAL_BAUDRATE = 9600
+
+
+class UdpPcmTap:
+    def __init__(self, host, port):
+        self.addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send(self, block):
+        pcm16 = (np.clip(block, -1, 1) * 32767).astype(np.int16)
+        self.sock.sendto(pcm16.tobytes(), self.addr)
 
 SAMPLE_RATE = 48000
 BLOCK_SIZE = 1024
@@ -48,6 +59,11 @@ HUMIDITY_WINDOW_SECONDS = 20.0
 HUMIDITY_MIN = 200.0
 HUMIDITY_MAX = 400.0
 SYNC_FRESHNESS_SECONDS = 2.0
+
+# Low-pass finale sui pulse prima del tap UDP verso il bridge.
+# Cutoff conservativo: attenua asprezza/aliasing sulle armoniche alte
+# senza cambiare la frequenza fondamentale della nota suonata.
+PULSE_BRIDGE_LOWPASS_CUTOFF_HZ = 5200.0
 
 _state_lock = threading.Lock()
 state_flags = {
@@ -185,7 +201,7 @@ def get_active_key_pc(sync_variant: bool) -> int:
 
 
 def get_pulse_root_midi(sync_variant: bool) -> int:
-    return 24 + get_active_key_pc(sync_variant)
+    return 43 + get_active_key_pc(sync_variant)
 
 
 def get_ambient_root_midi(sync_variant: bool) -> int:
@@ -213,9 +229,11 @@ def quantize_to_scale(semitones: int, max_semitones: int, scale_offsets: List[in
     return min(allowed, key=lambda x: abs(x - semitones))
 
 
-def adc_to_note(adc: int, root_midi: int = 36, max_semitones: int = 60, scale_offsets: Optional[List[int]] = None) -> int:
+def adc_to_note(adc: int, root_midi: int = 36, max_semitones: int = 24, scale_offsets: Optional[List[int]] = None) -> int:
     adc = max(0, min(1023, int(adc)))
-    semitones = int(round((adc / 1023.0) * max_semitones))
+    x = adc / 1023.0
+    x = x ** 1.2
+    semitones = int(round(x * max_semitones))
     q = quantize_to_scale(semitones, max_semitones, scale_offsets or get_scale_offsets(False))
     return root_midi + q
 
@@ -456,6 +474,18 @@ class StereoToneCorrector:
         return left.astype(np.float32), right.astype(np.float32)
 
 
+class StereoPulseBridgeLowpass:
+    def __init__(self, sr: int, cutoff_hz: float = PULSE_BRIDGE_LOWPASS_CUTOFF_HZ):
+        self.lp_l = OnePoleLowpass(sr, cutoff_hz)
+        self.lp_r = OnePoleLowpass(sr, cutoff_hz)
+
+    def process(self, left: np.ndarray, right: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        return (
+            self.lp_l.process(left).astype(np.float32),
+            self.lp_r.process(right).astype(np.float32),
+        )
+
+
 @dataclass
 class AmbientVoice:
     freq: float
@@ -585,6 +615,10 @@ class PlantSynth:
             "pulse_sync": StereoToneCorrector(sr, "pulse"),
             "ambient_sync": StereoToneCorrector(sr, "ambient"),
         }
+        self.pulse_bridge_lowpass = {
+            "base": StereoPulseBridgeLowpass(sr),
+            "sync": StereoPulseBridgeLowpass(sr),
+        }
         self.sync_reverbs = {
             "pulse": StereoReverb(sr),
             "ambient": StereoReverb(sr),
@@ -598,6 +632,11 @@ class PlantSynth:
             "ambient": StereoChorus(sr),
         }
         self.recorder = SessionRecorder(sr)
+
+        # WebRTC taps for ambience
+        self.tap_pulse_base = UdpPcmTap("127.0.0.1", 9102)
+        self.tap_pulse_sync = UdpPcmTap("127.0.0.1", 9103)
+
 
         self.streams = {
             "pulse_base": sd.OutputStream(
@@ -693,7 +732,7 @@ class PlantSynth:
             self.ambient_voices[stream_variant].append(voice)
             self.ambient_voices[stream_variant] = self.ambient_voices[stream_variant][-self.max_ambient_voices:]
 
-    def add_pulse_voice(self, midi_note: int, stream_variant: str, volume: float = 0.45, duration: float = 0.3, pan: float = 0.5):
+    def add_pulse_voice(self, midi_note: int, stream_variant: str, volume: float = 0.12, duration: float = 0.45, pan: float = 0.5):
         voice = PulseVoice(
             freq=midi_to_freq(midi_note),
             phase=0.0,
@@ -701,8 +740,8 @@ class PlantSynth:
             pan=float(pan),
             age=0.0,
             duration=float(duration),
-            vib_hz=5.0,
-            vib_cents=6.0,
+            vib_hz=3.2,
+            vib_cents=2.5,
         )
         with self.lock:
             if len(self.pulse_voices[stream_variant]) >= self.max_pulse_voices:
@@ -738,8 +777,8 @@ class PlantSynth:
         env = np.zeros_like(t, dtype=np.float32)
         tt = age[alive]
 
-        attack = min(0.04, voice.duration * 0.22)
-        release_start = voice.duration * 0.60
+        attack = min(0.09, voice.duration * 0.35)
+        release_start = voice.duration * 0.45
 
         env_alive = np.ones_like(tt, dtype=np.float32)
         if attack > 0:
@@ -758,8 +797,7 @@ class PlantSynth:
 
         signal = (
             np.sin(phase)
-            + 0.10 * np.sin(2 * phase)
-            + 0.015 * np.sin(3 * phase)
+            + 0.035 * np.sin(2 * phase)
         ).astype(np.float32)
 
         signal *= (voice.volume * env).astype(np.float32)
@@ -820,10 +858,32 @@ class PlantSynth:
             if reverb_amount > 0.0001:
                 left, right = self.sync_reverbs[voice_kind].process(left, right, reverb_amount)
 
+        # Filtro finale solo sui pulse, prima del tap UDP verso il bridge.
+        # Conserva la nota/fondamentale e smussa solo le armoniche alte piu' aggressive.
+        if voice_kind == "pulse":
+            left, right = self.pulse_bridge_lowpass[variant].process(left, right)
+
         active_pair_sync = is_sync_output_enabled()
         this_bus_active = (variant == "sync" and active_pair_sync) or (variant == "base" and not active_pair_sync)
 
-        out = np.stack([left, right], axis=1)
+        
+        premute = np.stack([left, right], axis=1)
+
+        # SEND AMBIENCE STREAMS (before muting)
+        if voice_kind == "pulse":
+            if variant == "base":
+                try:
+                    self.tap_pulse_base.send(premute)
+                except:
+                    pass
+            elif variant == "sync":
+                try:
+                    self.tap_pulse_sync.send(premute)
+                except:
+                    pass
+
+        out = premute.copy()
+
         if this_bus_active:
             out *= self.master_gain
         else:
@@ -848,7 +908,7 @@ class SerialReader(threading.Thread):
         self.zero_semis_streak = 0
         self.amb_stopped_due_zero = False
 
-        self.pulse_interval = 0.20
+        self.pulse_interval = 0.35
 
     def connect(self):
         self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=0.1)
@@ -926,21 +986,22 @@ class SerialReader(threading.Thread):
         touch = float(data.get("touch", 1) or 0)
 
         if is_pulse_enabled() and adc > 0:
-            pan = max(0.0, min(1.0, adc / 1023.0))
-            pulse_volume = 0.35 + 0.30 * pan
+            pan_raw = max(0.0, min(1.0, adc / 1023.0))
+            pan = 0.35 + 0.30 * pan_raw
+            pulse_volume = 0.16 + 0.16 * (pan ** 0.7)
             if touch > 0 and (now - self.last_pulse_time) >= self.pulse_interval:
                 for variant in ("base", "sync"):
                     pulse_note = adc_to_note(
                         adc,
                         root_midi=get_pulse_root_midi(variant == "sync"),
-                        max_semitones=60,
+                        max_semitones=28,
                         scale_offsets=get_scale_offsets(variant == "sync"),
                     )
                     self.synth.add_pulse_voice(
                         pulse_note,
                         stream_variant=variant,
                         volume=pulse_volume,
-                        duration=0.22 + 0.18 * pan,
+                        duration=0.30 + 0.18 * (pan_raw ** 0.5),
                         pan=pan,
                     )
                 self.last_pulse_time = now
@@ -1164,14 +1225,6 @@ async def sync_client(stop_flag: threading.Event):
                         sync_state["chorus"] = chorus
                         sync_state["last_update"] = time.time()
 
-                    print(
-                        f"[SYNC] scale={scale} "
-                        f"key={key_pc} "
-                        f"reverb={reverb:.3f} "
-                        f"distortion={distortion:.3f} "
-                        f"delay={delay:.3f} "
-                        f"chorus={chorus:.3f}"
-                    )
         except Exception as e:
             print(f"[SYNC] connection error: {e}")
             if stop_flag.is_set():

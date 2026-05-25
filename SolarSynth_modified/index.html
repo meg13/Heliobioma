@@ -323,6 +323,17 @@
     <div class="context-menu-item" id="removeLPControl">Remove control from Low Pass</div>
 </div>
 
+<script>
+// Intercetta AudioContext.resume() prima che Tone.js lo avvolga.
+// Tone.js chiama sempre resume() quando parte → catturiamo il native AudioContext.
+(function () {
+    const origResume = AudioContext.prototype.resume;
+    AudioContext.prototype.resume = function () {
+        window._solarNativeAudioContext = this;
+        return origResume.apply(this, arguments);
+    };
+})();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/tone@14.8.39/build/Tone.min.js"></script>
 <script type="module" src="js/main.js"></script>
 

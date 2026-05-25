@@ -4,11 +4,14 @@ export let audioFilter = null;
 export let mainLimiter = null;
 export let mainCompressor = null;
 export let masterVolume = null;
+export let solarSenderSocket = null;
+export let solarSenderTapNode = null;
+export let solarSenderTapGain = null;
+export let solarSenderTapStarted = false;
 export let toneStarted = false;
 export let lastPlayedMidi = null;
 export let lastPlayTime = 0;
 
-// Import setupEffectKnob from ui module
 import { setupEffectKnob as uiSetupEffectKnob } from './ui.js';
 const setupEffectKnob = uiSetupEffectKnob;
 
@@ -49,7 +52,13 @@ export let audioRoutingInitialized = false;
 export let effectsInputNode = null;
 export let effectsOutputNode = null;
 
-// Audio state object
+let solarSenderTapNodeRaw = null;
+let solarSenderTapDestination = null;
+let solarSenderTapMutedGain = null;
+let solarSenderTapInitPromise = null;
+let _toneDiagLastStage = '';
+let _toneStartPromise = null;
+
 export const audioState = {
     eqEnabled: false,
     eqHighpassFreq: 20,
@@ -64,7 +73,6 @@ export const audioState = {
     midiEnabled: false
 };
 
-// Getter/Setter per compatibilità
 export let eqEnabled = false;
 export let eqHighpassFreq = 20;
 export let eqLowpassFreq = 20000;
@@ -92,7 +100,6 @@ export const PRESET_SAMPLES = {
     halo: 'Sounds/halo.wav'
 };
 
-// Setter per sincronizzare audioState con variabili locali
 export function syncAudioState() {
     audioState.eqEnabled = eqEnabled;
     audioState.eqHighpassFreq = eqHighpassFreq;
@@ -137,8 +144,47 @@ export function setEQLowpassRolloff(rolloff) {
     }
 }
 
+function logToneDiagnostics(stage) {
+    if (_toneDiagLastStage === stage) return;
+    _toneDiagLastStage = stage;
+
+    const hasTone = typeof Tone !== 'undefined';
+    const hasStart = hasTone && typeof Tone.start === 'function';
+    const hasGetContext = hasTone && typeof Tone.getContext === 'function';
+    const toneContext = hasGetContext ? Tone.getContext() : null;
+    const rawContext = toneContext
+        ? (toneContext.rawContext || toneContext._nativeContext || toneContext._nativeAudioContext || null)
+        : null;
+
+    console.info('[Solar][ToneDiag]', {
+        stage,
+        hasTone,
+        hasStart,
+        hasGetContext,
+        toneStarted,
+        contextState: rawContext && typeof rawContext.state === 'string' ? rawContext.state : null,
+        contextCtor: rawContext && rawContext.constructor ? rawContext.constructor.name : null,
+    });
+}
+
+function isToneContextRunning() {
+    if (typeof Tone === 'undefined' || typeof Tone.getContext !== 'function') return false;
+    const toneCtx = Tone.getContext();
+    const rawContext = toneCtx
+        ? (toneCtx.rawContext || toneCtx._nativeContext || toneCtx._nativeAudioContext || null)
+        : null;
+    return !!(rawContext && rawContext.state === 'running');
+}
+
 export function ensureToneStarted() {
     try {
+        if (typeof Tone === 'undefined') {
+            console.warn('[Solar][ToneDiag] Tone is undefined. Check Tone script load order.');
+            return;
+        }
+
+        logToneDiagnostics('ensureToneStarted:enter');
+
         if (!mainLimiter) {
             mainLimiter = new Tone.Limiter(-2).toDestination();
             mainCompressor = new Tone.Compressor({
@@ -149,33 +195,425 @@ export function ensureToneStarted() {
             }).connect(mainLimiter);
             masterVolume = new Tone.Volume(-Infinity).connect(mainCompressor);
         }
+
         if (!outputMeter && masterVolume) {
             outputMeter = new Tone.Meter({ normalRange: false });
             masterVolume.connect(outputMeter);
         }
-        if (!toneSynth) toneSynth = new Tone.Synth({ oscillator: { type: 'sine' } }).connect(masterVolume);
-        
+
+        if (!toneSynth) {
+            toneSynth = new Tone.Synth({ oscillator: { type: 'sine' } }).connect(masterVolume);
+        }
+
         if (!fftAnalyser && masterVolume) {
             fftAnalyser = new Tone.FFT(512);
             masterVolume.connect(fftAnalyser);
-            
+
             import('./spectrum.js').then(spectrumModule => {
                 spectrumModule.initSpectrum(fftAnalyser);
             }).catch(e => console.warn('Failed to init spectrum:', e));
         }
-        
-        if (!toneStarted && typeof Tone !== 'undefined' && Tone.start) {
-            Tone.start();
+
+        if (!toneStarted && isToneContextRunning()) {
             toneStarted = true;
-            if (masterVolume) {
-                masterVolume.volume.rampTo(currentVolumeDb, 1.5);
-            }
+            logToneDiagnostics('ensureToneStarted:context-already-running');
         }
+
+        if (!toneStarted) {
+            if (typeof Tone.start !== 'function') {
+                console.warn('[Solar][ToneDiag] Tone.start is not a function.');
+                logToneDiagnostics('ensureToneStarted:missing-start');
+            } else if (!_toneStartPromise) {
+                _toneStartPromise = Promise.resolve()
+                    .then(() => Tone.start())
+                    .then(() => {
+                        toneStarted = isToneContextRunning() || true;
+                        logToneDiagnostics('Tone.start:resolved');
+                        if (masterVolume) {
+                            masterVolume.volume.rampTo(currentVolumeDb, 1.5);
+                        }
+                        return startSolarSenderTap().catch(e => {
+                            console.warn('Failed to start solar sender tap', e);
+                        });
+                    })
+                    .catch(e => {
+                        console.warn('Tone.start failed:', e);
+                        logToneDiagnostics('Tone.start:rejected');
+                    })
+                    .finally(() => {
+                        _toneStartPromise = null;
+                    });
+            }
+        } else {
+            logToneDiagnostics('ensureToneStarted:already-started');
+            startSolarSenderTap().catch(e => console.warn('Failed to start solar sender tap', e));
+        }
+
         if (!metronomeOsc) {
             initMetronome();
         }
     } catch (e) {
         console.warn('Tone.js not available or failed to start', e);
+    }
+}
+
+let _solarReconnectTimer = null;
+
+function ensureSolarSocket() {
+    if (
+        solarSenderSocket &&
+        (solarSenderSocket.readyState === WebSocket.OPEN ||
+            solarSenderSocket.readyState === WebSocket.CONNECTING)
+    ) {
+        return solarSenderSocket;
+    }
+
+    solarSenderSocket = new WebSocket('ws://127.0.0.1:8080/solar');
+    solarSenderSocket.binaryType = 'arraybuffer';
+    solarSenderSocket.onopen = () => {
+        console.log('[Solar] WebSocket connected to bridge.py');
+        if (_solarReconnectTimer) {
+            clearTimeout(_solarReconnectTimer);
+            _solarReconnectTimer = null;
+        }
+    };
+    solarSenderSocket.onclose = () => {
+        console.warn('[Solar] WebSocket closed, reconnecting in 2s...');
+        _solarReconnectTimer = setTimeout(() => ensureSolarSocket(), 2000);
+    };
+    solarSenderSocket.onerror = (e) => console.warn('[Solar] WebSocket error', e);
+    return solarSenderSocket;
+}
+
+function startSolarSocketLoop() {
+    ensureSolarSocket();
+}
+
+function resolveNativeAudioContext(ctxLike) {
+    if (!ctxLike) return null;
+
+    const AudioCtx = globalThis.AudioContext;
+    const OfflineCtx = globalThis.OfflineAudioContext;
+    const queue = [ctxLike];
+    const seen = new Set();
+    const nestedKeys = [
+        '_nativeContext',
+        '_nativeAudioContext',
+        '_nativeEventTarget',
+        'rawContext',
+        'context',
+        '_context',
+    ];
+
+    while (queue.length > 0) {
+        const c = queue.shift();
+        if (!c || typeof c !== 'object') continue;
+        if (seen.has(c)) continue;
+        seen.add(c);
+
+        try {
+            if (AudioCtx && c instanceof AudioCtx) return c;
+            if (OfflineCtx && c instanceof OfflineCtx) return c;
+        } catch (_) {}
+
+        for (const k of nestedKeys) {
+            try {
+                const n = c[k];
+                if (n && typeof n === 'object' && !seen.has(n)) {
+                    queue.push(n);
+                }
+            } catch (_) {}
+        }
+    }
+
+    return null;
+}
+
+function resolveNativeAudioNode(nodeLike, targetContext = null) {
+    if (!nodeLike) return null;
+
+    const AudioNodeCtor = globalThis.AudioNode;
+    const queue = [nodeLike];
+    const seen = new Set();
+    const nestedKeys = [
+        // Tone.js 14+ internals
+        '_gainNode',         // Tone.Volume / Tone.Gain wrap a GainNode here
+        '_nativeAudioNode',  // some ToneAudioNode versions expose it here
+        '_nativeNode',
+        '_node',
+        '_internalNode',
+        // Standard ToneAudioNode interface
+        'input',
+        'output',
+        '_input',
+        '_output',
+        '_source',
+        '_gain',
+        'context',
+    ];
+
+    while (queue.length > 0) {
+        const n = queue.shift();
+        if (!n || (typeof n !== 'object' && typeof n !== 'function')) continue;
+        if (seen.has(n)) continue;
+        seen.add(n);
+
+        const looksLikeAudioNode = AudioNodeCtor
+            ? n instanceof AudioNodeCtor
+            : typeof n.connect === 'function' && 'context' in n;
+
+        if (looksLikeAudioNode) {
+            if (!targetContext || n.context === targetContext) {
+                return n;
+            }
+        }
+
+        for (const k of nestedKeys) {
+            try {
+                const child = n[k];
+                if (child && (typeof child === 'object' || typeof child === 'function') && !seen.has(child)) {
+                    queue.push(child);
+                }
+            } catch (_) {}
+        }
+    }
+
+    return null;
+}
+
+let _pcmWorkletModuleLoaded = false;
+
+async function createSolarSenderWorklet(ctx) {
+    const workletSource = `
+class PcmSenderProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.chunkFrames = 960;
+    this.left = new Float32Array(this.chunkFrames);
+    this.right = new Float32Array(this.chunkFrames);
+    this.index = 0;
+  }
+
+  flush() {
+    if (this.index === 0) return;
+    const pcm = new Int16Array(this.index * 2);
+    for (let i = 0; i < this.index; i++) {
+      const l = Math.max(-1, Math.min(1, this.left[i] || 0));
+      const r = Math.max(-1, Math.min(1, this.right[i] || 0));
+      pcm[i * 2]     = l < 0 ? l * 32768 : l * 32767;
+      pcm[i * 2 + 1] = r < 0 ? r * 32768 : r * 32767;
+    }
+    this.port.postMessage(pcm.buffer, [pcm.buffer]);
+    this.index = 0;
+  }
+
+  process(inputs, outputs) {
+    const input  = inputs[0];
+    const output = outputs[0];
+
+    if (output && output.length > 0) {
+      for (let ch = 0; ch < output.length; ch++) {
+        output[ch].fill(0);
+      }
+    }
+
+    if (!input || input.length === 0) return true;
+
+    const leftIn  = input[0];
+    const rightIn = input[1] || input[0];
+    if (!leftIn) return true;
+
+    for (let i = 0; i < leftIn.length; i++) {
+      this.left[this.index]  = leftIn[i];
+      this.right[this.index] = rightIn ? rightIn[i] : leftIn[i];
+      this.index++;
+      if (this.index >= this.chunkFrames) {
+        this.flush();
+      }
+    }
+    return true;
+  }
+}
+try {
+    registerProcessor('pcm-sender-processor', PcmSenderProcessor);
+} catch (e) {
+    const msg = (e && e.message) ? String(e.message) : '';
+    if (!(e && e.name === 'NotSupportedError') && !msg.includes('already registered')) {
+        throw e;
+    }
+}
+`;
+
+    if (!_pcmWorkletModuleLoaded) {
+        const blob = new Blob([workletSource], { type: 'application/javascript' });
+        const moduleUrl = URL.createObjectURL(blob);
+        try {
+            await ctx.audioWorklet.addModule(moduleUrl);
+            _pcmWorkletModuleLoaded = true;
+        } finally {
+            URL.revokeObjectURL(moduleUrl);
+        }
+    }
+
+    return new AudioWorkletNode(ctx, 'pcm-sender-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+        channelCount: 2,
+        channelCountMode: 'explicit',
+        channelInterpretation: 'speakers'
+    });
+}
+
+export async function startSolarSenderTap() {
+    if (solarSenderTapStarted) return;
+    if (solarSenderTapInitPromise) return solarSenderTapInitPromise;
+
+    solarSenderTapInitPromise = (async () => {
+        const tap_log  = (stage, data) => console.info(`[Solar][Tap] ${stage}`, data ?? '');
+        const tap_fail = (stage, err) => {
+            console.error(`[Solar][Tap] ❌ FAILED at stage: "${stage}"`, err);
+            console.error(`[Solar][Tap]    name=${err?.name}  message=${err?.message}`);
+        };
+
+        try {
+            tap_log('1 – check Tone');
+            if (typeof Tone === 'undefined' || !Tone.getContext) {
+                tap_log('abort: Tone not ready'); return;
+            }
+            if (!masterVolume) {
+                tap_log('abort: masterVolume is null'); return;
+            }
+
+            tap_log('2 – resolve AudioContext');
+            const toneCtx = Tone.getContext();
+            const ctx = resolveNativeAudioContext(toneCtx?.rawContext || toneCtx);
+            tap_log('2 – resolved ctx', { state: ctx?.state, ctor: ctx?.constructor?.name });
+            if (!ctx) { tap_log('abort: ctx is null'); return; }
+
+            tap_log('3 – ensureSolarSocket');
+            ensureSolarSocket();
+
+            if (ctx.audioWorklet) {
+                tap_log('4a – trying AudioWorklet');
+                try {
+                    solarSenderTapNodeRaw = await createSolarSenderWorklet(ctx);
+                    tap_log('4a – AudioWorklet created OK');
+                    solarSenderTapNodeRaw.port.onmessage = (event) => {
+                        const socket = ensureSolarSocket();
+                        if (socket.readyState === WebSocket.OPEN) {
+                            socket.send(event.data);
+                        }
+                    };
+                } catch (workletErr) {
+                    tap_fail('4a – AudioWorklet creation', workletErr);
+                    solarSenderTapNodeRaw = null;
+                }
+            } else {
+                tap_log('4a – audioWorklet not available, will use ScriptProcessor');
+            }
+
+            if (!solarSenderTapNodeRaw) {
+                if (ctx.createScriptProcessor) {
+                    tap_log('4b – creating ScriptProcessorNode');
+                    try {
+                        const node = ctx.createScriptProcessor(1024, 2, 2);
+                        node.onaudioprocess = (e) => {
+                            const socket = ensureSolarSocket();
+                            if (socket.readyState !== WebSocket.OPEN) return;
+                            const ch0 = e.inputBuffer.getChannelData(0);
+                            const ch1 = e.inputBuffer.numberOfChannels > 1
+                                ? e.inputBuffer.getChannelData(1) : ch0;
+                            const pcm = new Int16Array(ch0.length * 2);
+                            for (let i = 0; i < ch0.length; i++) {
+                                const l = Math.max(-1, Math.min(1, ch0[i]));
+                                const r = Math.max(-1, Math.min(1, ch1[i]));
+                                pcm[i * 2]     = l < 0 ? l * 32768 : l * 32767;
+                                pcm[i * 2 + 1] = r < 0 ? r * 32768 : r * 32767;
+                            }
+                            socket.send(pcm.buffer);
+                        };
+                        solarSenderTapNodeRaw = node;
+                        tap_log('4b – ScriptProcessorNode created OK');
+                    } catch (spErr) {
+                        tap_fail('4b – ScriptProcessorNode creation', spErr);
+                        return;
+                    }
+                } else {
+                    tap_log('abort: no AudioWorklet and no createScriptProcessor');
+                    return;
+                }
+            }
+
+            tap_log('5 – creating gain nodes');
+            solarSenderTapDestination = ctx.createGain();
+            solarSenderTapDestination.gain.value = 0.0001;
+
+            solarSenderTapMutedGain = ctx.createGain();
+            solarSenderTapMutedGain.gain.value = 0.0001;
+
+            const tapBridgeGain = ctx.createGain();
+            tapBridgeGain.gain.value = 1.0;
+
+            // masterVolume is a Tone.js node — its .connect() only accepts other Tone nodes.
+            // tapBridgeGain is a native Web Audio GainNode, so we must resolve the
+            // underlying native AudioNode first and use the native .connect() API.
+            tap_log('6 – resolving native node of masterVolume');
+            // Diagnostic: dump accessible keys on masterVolume so we can see Tone's internals
+            try {
+                const mvDump = {};
+                // Own enumerable + non-enumerable keys
+                const allKeys = [
+                    ...Object.keys(masterVolume),
+                    ...Object.getOwnPropertyNames(masterVolume),
+                    ...Object.getOwnPropertyNames(Object.getPrototypeOf(masterVolume) ?? {})
+                ];
+                for (const k of [...new Set(allKeys)]) {
+                    try { mvDump[k] = typeof masterVolume[k]; } catch (_) { mvDump[k] = '(throws)'; }
+                }
+                tap_log('6 – masterVolume property map', mvDump);
+            } catch (dumpErr) {
+                tap_log('6 – masterVolume dump failed', dumpErr?.message);
+            }
+            const nativeMasterVolume = resolveNativeAudioNode(masterVolume, ctx);
+            tap_log('6 – resolved', {
+                found: !!nativeMasterVolume,
+                ctor: nativeMasterVolume?.constructor?.name,
+                sameCtx: nativeMasterVolume?.context === ctx
+            });
+            if (!nativeMasterVolume) {
+                tap_fail('6', new Error('Could not resolve native AudioNode for masterVolume'));
+                return;
+            }
+            tap_log('6b – nativeMasterVolume.connect(tapBridgeGain)');
+            nativeMasterVolume.connect(tapBridgeGain);
+
+            tap_log('7 – tapBridgeGain.connect(solarSenderTapNodeRaw)');
+            tapBridgeGain.connect(solarSenderTapNodeRaw);
+
+            tap_log('8 – solarSenderTapNodeRaw.connect(solarSenderTapDestination)');
+            solarSenderTapNodeRaw.connect(solarSenderTapDestination);
+
+            tap_log('9 – solarSenderTapDestination.connect(solarSenderTapMutedGain)');
+            solarSenderTapDestination.connect(solarSenderTapMutedGain);
+
+            tap_log('10 – solarSenderTapMutedGain.connect(ctx.destination)');
+            solarSenderTapMutedGain.connect(ctx.destination);
+
+            solarSenderTapNode    = solarSenderTapNodeRaw;
+            solarSenderTapGain    = solarSenderTapMutedGain;
+            solarSenderTapStarted = true;
+            tap_log('✅ Solar sender tap started successfully');
+
+        } catch (outerErr) {
+            tap_fail('OUTER (unexpected)', outerErr);
+        }
+    })();
+
+    try {
+        await solarSenderTapInitPromise;
+    } finally {
+        solarSenderTapInitPromise = null;
     }
 }
 
@@ -185,7 +623,6 @@ export function setMasterVolume(volumeDb) {
     currentVolumeDb = clamped;
     if (masterVolume) masterVolume.volume.rampTo(clamped, 0.1);
 }
-
 
 export function initMetronome() {
     try {
@@ -203,20 +640,20 @@ export function initMetronome() {
                 release: 0.1
             }
         }).connect(metronomePanner);
-        
+
         Tone.Transport.scheduleRepeat((time) => {
             if (metronomeEnabled) {
                 const position = Tone.Transport.position.split(':');
                 const quarter = parseInt(position[1]);
 
                 if (quarter === 0) {
-                    metronomeOsc.triggerAttackRelease('G6', '32n', time, 1); 
+                    metronomeOsc.triggerAttackRelease('G6', '32n', time, 1);
                 } else {
                     metronomeOsc.triggerAttackRelease('C6', '32n', time, 0.6);
                 }
             }
         }, '4n');
-        
+
         console.log('Metronome initialized');
     } catch (e) {
         console.warn('Failed to initialize metronome', e);
@@ -237,24 +674,25 @@ export async function loadSampleFromUrl(url, rootMidi = 60, name = null) {
     try {
         if (typeof Tone === 'undefined') throw new Error('Tone.js required');
         ensureToneStarted();
-        
+
         if (samplePlayer) {
-            try {
-                samplePlayer.dispose();
-            } catch (e) {}
+            try { samplePlayer.dispose(); } catch (e) {}
         }
-        
+
         const response = await fetch(url);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const arrayBuffer = await response.arrayBuffer();
-        
-        const audioContext = Tone.getContext().rawContext;
+
+        const toneCtx = Tone.getContext();
+        const audioContext = resolveNativeAudioContext(toneCtx?.rawContext || toneCtx);
+        if (!audioContext) throw new Error('Unable to resolve native AudioContext');
         const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-        
+
         samplePlayer = new Tone.Player({ onload: () => {} });
         samplePlayer.buffer.set(audioBuffer);
-        
+
         const sampleRootMidi = Number(rootMidi) || 60;
+        void sampleRootMidi;
         sampleLoadedName = name || url;
         return true;
     } catch (e) {
@@ -269,8 +707,7 @@ export async function loadPresetSample(name) {
     const url = PRESET_SAMPLES[name];
     if (!url) return;
 
-    const rootMidi = 60;
-    await loadSampleFromUrl(url, rootMidi, name);
+    await loadSampleFromUrl(url, 60, name);
 
     const status = document.getElementById('sampleStatus');
     if (status && name) {
@@ -293,7 +730,7 @@ export function pickSampleFile(rootMidi = 60, fileInputEl = null) {
 
     if (fileInputEl) {
         fileInputEl.value = '';
-        
+
         const file = fileInputEl.files && fileInputEl.files[0];
         if (file) return handleFile(file);
 
@@ -340,44 +777,45 @@ export function playSampleAtMidi(midi, time) {
             console.warn('No sample loaded or buffer missing');
             return false;
         }
-        
+
         if (!audioRoutingInitialized) {
             initializeAudioChain();
         }
-        
+
         const root = 60;
         const semitoneShift = midi - root;
-        
+
         ensureToneStarted();
         pruneSampleVoices();
-        
+
         const temp = new Tone.Player(samplePlayer.buffer);
         const cleanup = trackSampleVoice(temp);
-        
+
         temp.connect(effectsInputNode);
-        
         temp.volume.value = -4;
-        
+
         const playbackRate = Math.pow(2, semitoneShift / 12);
-        if (temp.playbackRate instanceof Tone.Signal || 
-            (temp.playbackRate && typeof temp.playbackRate.value !== 'undefined')) {
+        if (
+            temp.playbackRate instanceof Tone.Signal ||
+            (temp.playbackRate && typeof temp.playbackRate.value !== 'undefined')
+        ) {
             temp.playbackRate.value = playbackRate;
         } else {
             temp.playbackRate = playbackRate;
         }
-        
+
         if (time) {
             temp.start(time);
         } else {
             temp.start();
         }
-        
+
         setTimeout(() => {
             try { temp.stop(); } catch (e) {}
             try { temp.dispose(); } catch (e) {}
             cleanup();
         }, (samplePlayer.buffer.duration / playbackRate + 0.5) * 1000);
-        
+
         return true;
     } catch (e) {
         console.warn('Sample play failed', e);
@@ -387,17 +825,15 @@ export function playSampleAtMidi(midi, time) {
 
 export function initializeAudioChain() {
     if (audioRoutingInitialized) return;
-    
+
     try {
         ensureToneStarted();
-        
-        reverb = new Tone.Reverb({ decay: 1.5, wet: 0 });
-        distortion = new Tone.Distortion({ distortion: 0, wet: 0 });
-        chorus = new Tone.Chorus({ frequency: 1.5, delayTime: 3.5, depth: 0.7, wet: 0 });
-        // Defer starting the chorus LFO to ensure we do it only once (see ensureChorusStarted).
-        // DELAY: Inizializzato con wet: 0 (spento)
-        delay = new Tone.FeedbackDelay({ delayTime: 0.25, feedback: 0.5, wet: 0 });
-        
+
+        reverb      = new Tone.Reverb({ decay: 1.5, wet: 0 });
+        distortion  = new Tone.Distortion({ distortion: 0, wet: 0 });
+        chorus      = new Tone.Chorus({ frequency: 1.5, delayTime: 3.5, depth: 0.7, wet: 0 });
+        delay       = new Tone.FeedbackDelay({ delayTime: 0.25, feedback: 0.5, wet: 0 });
+
         if (!eqHighpassFilter) {
             eqHighpassFilter = new Tone.Filter({
                 type: 'highpass',
@@ -406,7 +842,7 @@ export function initializeAudioChain() {
                 Q: eqHighpassQ
             });
         }
-        
+
         if (!eqLowpassFilter) {
             eqLowpassFilter = new Tone.Filter({
                 type: 'lowpass',
@@ -415,15 +851,14 @@ export function initializeAudioChain() {
                 Q: eqLowpassQ
             });
         }
-        
+
         delay.chain(chorus, distortion, reverb, eqHighpassFilter, eqLowpassFilter, masterVolume);
-        
-        effectsInputNode = delay;
+
+        effectsInputNode  = delay;
         effectsOutputNode = masterVolume;
-        
+
         audioRoutingInitialized = true;
         console.log('Audio chain initialized');
-        
     } catch (e) {
         console.error('Failed to initialize audio chain:', e);
     }
@@ -432,7 +867,7 @@ export function initializeAudioChain() {
 export function setEQEnabled(enabled) {
     eqEnabled = enabled;
     audioState.eqEnabled = enabled;
-    
+
     if (eqHighpassFilter && eqLowpassFilter) {
         if (enabled) {
             eqHighpassFilter.frequency.rampTo(eqHighpassFreq, 0.05);
@@ -442,7 +877,7 @@ export function setEQEnabled(enabled) {
             eqLowpassFilter.frequency.rampTo(20000, 0.05);
         }
     }
-    
+
     console.log(`EQ ${enabled ? 'enabled' : 'disabled'}`);
 }
 
@@ -461,7 +896,7 @@ export function createEQFilters() {
         if (masterVolume) eqHighpassFilter.connect(masterVolume);
         audioState.eqHighpassFilter = eqHighpassFilter;
     }
-    
+
     if (!eqLowpassFilter) {
         eqLowpassFilter = new Tone.Filter({
             type: 'lowpass',
@@ -476,7 +911,7 @@ export function createEQFilters() {
 
 function startDbMeterLoop() {
     if (meterAnimationId) return;
-    
+
     const loop = () => {
         const fill = document.getElementById('dbMeterFill');
         if (!fill || !outputMeter) {
@@ -485,17 +920,16 @@ function startDbMeterLoop() {
         }
         let level = outputMeter.getValue();
         if (!Number.isFinite(level)) level = -60;
-        const colorLevel = level;
         const clamped = Math.max(-60, Math.min(0, level));
         const pct = Math.max(0, Math.min(1, (clamped + 60) / 60));
         fill.style.width = `${pct * 100}%`;
         let color = '#22c55e';
-        if (colorLevel > -3 && colorLevel <= 0) color = '#fbbf24';
-        else if (colorLevel > 0) color = '#ef4444';
+        if (level > -3 && level <= 0) color = '#fbbf24';
+        else if (level > 0) color = '#ef4444';
         fill.style.background = color;
         meterAnimationId = requestAnimationFrame(loop);
     };
-    
+
     meterAnimationId = requestAnimationFrame(loop);
 }
 
@@ -507,7 +941,7 @@ function updateDbReadout(volumeDb) {
 }
 
 function attachVolumeSlider() {
-    const thumb = document.getElementById('volumeThumb');
+    const thumb  = document.getElementById('volumeThumb');
     const slider = document.querySelector('.volume-slider');
     if (!thumb || !slider) return;
 
@@ -568,20 +1002,13 @@ function attachVolumeSlider() {
     document.addEventListener('mouseup', endDrag);
 }
 
-
 function setupEffectToggle(effectName) {
     const toggleBtns = document.querySelectorAll(`[data-effect="${effectName}"]`);
-    
+
     toggleBtns.forEach(btn => {
-        // Inizializza lo stato visuale del pulsante (tutti gli effetti partono spenti)
-        if (effectName === 'eq') {
-            btn.textContent = 'OFF';
-            btn.classList.remove('active');
-        } else {
-            btn.textContent = 'OFF';
-            btn.classList.remove('active');
-        }
-        
+        btn.textContent = 'OFF';
+        btn.classList.remove('active');
+
         btn.addEventListener('click', () => {
             if (effectName === 'eq') {
                 eqEnabled = !eqEnabled;
@@ -621,18 +1048,18 @@ function setupEffectToggle(effectName) {
 }
 
 function getEffectNode(effectName) {
-    switch(effectName) {
+    switch (effectName) {
         case 'distortion': return distortion;
-        case 'chorus': return chorus;
-        case 'delay': return delay;
-        case 'reverb': return reverb;
-        default: return null;
+        case 'chorus':     return chorus;
+        case 'delay':      return delay;
+        case 'reverb':     return reverb;
+        default:           return null;
     }
 }
 
 function applyDelayTime(target) {
     if (!delay) return;
-    const quantized = Math.round((target * 1000) / 10) * 10 / 1000; // step 10ms
+    const quantized = Math.round((target * 1000) / 10) * 10 / 1000;
     try {
         if (typeof delay.delayTime.setValueAtTime === 'function' && typeof Tone !== 'undefined' && Tone.now) {
             delay.delayTime.setValueAtTime(quantized, Tone.now());
@@ -677,27 +1104,23 @@ function ensureChorusStarted() {
 }
 
 export async function initAudioUI() {
+    startSolarSocketLoop();
     ensureToneStarted();
     initializeAudioChain();
     syncAudioState();
-    
+
     if (outputMeter) {
         console.log('Starting dB meter loop');
-        startDbMeterLoop(outputMeter);
+        startDbMeterLoop();
     }
-    
+
     attachVolumeSlider();
 
-    // SETUP PULSANTI (TOGGLES) PRIMA DEI KNOBS
-    // Questo è fondamentale! Attiviamo i toggle così quando inizializziamo i knob,
-    // questi trovano il pulsante già "ON" e applicano il valore.
     setupEffectToggle('distortion');
     setupEffectToggle('chorus');
     setupEffectToggle('delay');
     setupEffectToggle('reverb');
     setupEffectToggle('eq');
-
-    // ORA CONFIGURIAMO I KNOB
 
     setupEffectKnob('distortionDriveKnob', (value) => {
         distortionDriveValue = value;
@@ -706,7 +1129,7 @@ export async function initAudioUI() {
             distortion.distortion = amt;
         }
     }, 0, (v) => `${Math.round(v * 100)}%`);
-    
+
     setupEffectKnob('distortionToneKnob', (value) => {
         distortionToneFactor = 0.5 + value * 0.5;
         if (distortion) {
@@ -714,7 +1137,7 @@ export async function initAudioUI() {
             distortion.distortion = amt;
         }
     }, 0, (v) => `${Math.round(v * 100)}%`);
-    
+
     setupEffectKnob('distortionMixKnob', (value) => {
         if (distortion) {
             distortion._lastWet = value;
@@ -729,12 +1152,12 @@ export async function initAudioUI() {
         ensureChorusStarted();
         if (chorus) chorus.depth = value;
     }, 0, (v) => `${Math.round(v * 100)}%`);
-    
+
     setupEffectKnob('chorusRateKnob', (value) => {
         ensureChorusStarted();
         if (chorus) chorus.frequency.value = 0.5 + value * 4.5;
     }, 0, (v) => `${(0.5 + v * 4.5).toFixed(2)} Hz`);
-    
+
     setupEffectKnob('chorusMixKnob', (value) => {
         if (chorus) {
             chorus._lastWet = value;
@@ -752,15 +1175,15 @@ export async function initAudioUI() {
         if (delayTimeTimer) clearTimeout(delayTimeTimer);
         delayTimeTimer = setTimeout(flushDelayTimePending, 120);
     }, 0, (v) => {
-        const raw = 0.01 + v * 0.99;
+        const raw   = 0.01 + v * 0.99;
         const quant = Math.round((raw * 1000) / 10) * 10 / 1000;
         return `${(quant * 1000).toFixed(0)} ms`;
     });
-    
+
     setupEffectKnob('delayFeedbackKnob', (value) => {
         if (delay) delay.feedback.value = value * 0.95;
     }, 0, (v) => `${Math.round(v * 100)}%`);
-    
+
     setupEffectKnob('delayMixKnob', (value) => {
         if (delay) {
             delay._lastWet = value;
@@ -776,7 +1199,7 @@ export async function initAudioUI() {
     setupEffectKnob('reverbDecayKnob', (value) => {
         if (reverb) reverb.decay = 0.1 + value * 9.9;
     }, 0, (v) => `${(0.1 + v * 9.9).toFixed(1)}s`);
-    
+
     setupEffectKnob('reverbMixKnob', (value) => {
         if (reverb) {
             reverb._lastWet = value;
@@ -786,12 +1209,11 @@ export async function initAudioUI() {
             }
         }
     }, 0, (v) => `${Math.round(v * 100)}%`);
-    
+
     setupEffectKnob('reverbSizeKnob', (value) => {
         if (reverb) reverb.preDelay = value * 0.1;
-    }, 0, (v) => `${Math.round(v * 100)}%`);    
-    
-    // Setup preset sample selector
+    }, 0, (v) => `${Math.round(v * 100)}%`);
+
     const presetSelect = document.getElementById('presetSampleSelect');
     if (presetSelect) {
         presetSelect.addEventListener('change', async (e) => {
@@ -799,12 +1221,13 @@ export async function initAudioUI() {
             console.log('Loading preset:', preset);
             await loadPresetSample(preset);
         });
-        
-        // Load default preset (halo)
+
         if (presetSelect.value) {
-            loadPresetSample(presetSelect.value).catch(e => console.warn('Failed to load default preset:', e));
+            loadPresetSample(presetSelect.value).catch(e =>
+                console.warn('Failed to load default preset:', e)
+            );
         }
     }
-    
+
     console.log('✅ Audio UI initialized');
 }
